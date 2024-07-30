@@ -13,6 +13,10 @@ import torch
 import folder_paths
 import comfy.model_management as mm
 
+def load_model_with_float32(model_path):
+    model = torch.load(model_path, map_location='cpu')
+    model = model.to(torch.float32)
+    return model
 
 def chatglm3_text_encode(chatglm3_model, prompt):
     device = mm.get_torch_device()
@@ -91,7 +95,6 @@ def MZ_ChatGLM3Loader_call(args):
 
     from comfy.utils import load_torch_file
     from contextlib import nullcontext
-    is_accelerate_available = False
     try:
         from accelerate import init_empty_weights
         from accelerate.utils import set_module_tensor_to_device
@@ -121,7 +124,6 @@ def MZ_ChatGLM3Loader_call(args):
             set_module_tensor_to_device(
                 text_encoder, key, device=offload_device, value=text_encoder_sd[key])
     else:
-        print("WARNING: Accelerate not available, use load_state_dict load model")
         text_encoder.load_state_dict(text_encoder_sd)
 
     tokenizer_path = os.path.join(
@@ -159,39 +161,6 @@ def MZ_ChatGLM3TextEncodeV2_call(args):
     ]], )
 
 
-def MZ_ChatGLM3Embeds2Conditioning_call(args):
-    kolors_embeds = args.get("kolors_embeds")
-
-    # kolors_embeds = {
-    #     'prompt_embeds': prompt_embeds,
-    #     'negative_prompt_embeds': negative_prompt_embeds,
-    #     'pooled_prompt_embeds': text_proj,
-    #     'negative_pooled_prompt_embeds': negative_text_proj
-    # }
-
-    positive = [[
-        kolors_embeds['prompt_embeds'],
-        {
-            "pooled_output": kolors_embeds['pooled_prompt_embeds'],
-            "width": args.get("width"),
-            "height": args.get("height"),
-            "crop_w": args.get("crop_w"),
-            "crop_h": args.get("crop_h"),
-            "target_width": args.get("target_width"),
-            "target_height": args.get("target_height")
-        }
-    ]]
-
-    negative = [[
-        kolors_embeds['negative_prompt_embeds'],
-        {
-            "pooled_output": kolors_embeds['negative_pooled_prompt_embeds'],
-        }
-    ]]
-
-    return (positive, negative)
-
-
 def MZ_KolorsUNETLoaderV2_call(kwargs):
 
     from . import hook_comfyui_kolors_v2
@@ -210,126 +179,85 @@ def MZ_KolorsUNETLoaderV2_call(kwargs):
         return (model, )
 
 
-def MZ_KolorsCheckpointLoaderSimple_call(kwargs):
-    checkpoint_name = kwargs.get("ckpt_name")
-
-    ckpt_path = folder_paths.get_full_path("checkpoints", checkpoint_name)
-
-    from . import hook_comfyui_kolors_v2
-    import comfy.sd
-
-    with hook_comfyui_kolors_v2.apply_kolors():
-        out = comfy.sd.load_checkpoint_guess_config(
-            ckpt_path, output_vae=True, output_clip=False, embedding_directory=folder_paths.get_folder_paths("embeddings"))
-
-        unet, _, vae = out[:3]
-        return (unet, vae)
+from comfy.cldm.cldm import ControlNet
+from comfy.controlnet import ControlLora
 
 
 from comfy.cldm.cldm import ControlNet
 from comfy.controlnet import ControlLora
 
-
-def MZ_KolorsControlNetLoader_call(kwargs):
-    control_net_name = kwargs.get("control_net_name")
-    controlnet_path = folder_paths.get_full_path(
-        "controlnet", control_net_name)
-
-    from torch import nn
-    from . import hook_comfyui_kolors_v2
-    import comfy.controlnet
-
-    with hook_comfyui_kolors_v2.apply_kolors():
-        control_net = comfy.controlnet.load_controlnet(controlnet_path)
-        return (control_net, )
-
-
 def MZ_KolorsControlNetPatch_call(kwargs):
-    import copy
     from . import hook_comfyui_kolors_v2
-    import comfy.model_management
-    import comfy.model_patcher
-
     model = kwargs.get("model")
     control_net = kwargs.get("control_net")
-
-    if hasattr(control_net, "control_model") and hasattr(control_net.control_model, "encoder_hid_proj"):
-        return (control_net,)
-
-    control_net = copy.deepcopy(control_net)
-
     import comfy.controlnet
-    if isinstance(control_net, ControlLora):
-        del_keys = []
-        for k in control_net.control_weights:
-            if k.startswith("label_emb.0.0."):
-                del_keys.append(k)
 
-        for k in del_keys:
-            control_net.control_weights.pop(k)
+    def ensure_float32(tensor):
+        if isinstance(tensor, torch.Tensor):
+            return tensor.to(torch.float32)
+        return tensor
+
+    def adjust_tensor_shape(tensor, target_shape):
+        if isinstance(tensor, torch.Tensor) and tensor.shape != target_shape:
+            return tensor.view(target_shape)
+        return tensor
+
+    def KolorsControlNet_forward(self, x, hint, timesteps, context, **kwargs):
+        with torch.no_grad():
+            x = ensure_float32(x)
+            hint = ensure_float32(hint)
+            timesteps = ensure_float32(timesteps)
+            context = ensure_float32(context)
+
+            # 确保 context 的形状与 x 兼容
+            if isinstance(context, torch.Tensor) and context.dim() == 2:
+                context = context.unsqueeze(1).expand(-1, x.size(1), -1)
+
+            # 确保 model.model.diffusion_model.encoder_hid_proj 也使用 float32
+            original_dtype = model.model.diffusion_model.encoder_hid_proj.weight.dtype
+            model.model.diffusion_model.encoder_hid_proj.to(torch.float32)
+            
+            context = model.model.diffusion_model.encoder_hid_proj(context)
+            
+            # 将 encoder_hid_proj 恢复到原始数据类型
+            model.model.diffusion_model.encoder_hid_proj.to(original_dtype)
+
+            return super_forward(self, x, hint, timesteps, context, **kwargs)
+
+    if isinstance(control_net, ControlLora):
+        # 移除不必要的权重
+        control_net.control_weights = {k: v for k, v in control_net.control_weights.items() if not k.startswith("label_emb.0.0.")}
 
         super_pre_run = ControlLora.pre_run
+        super_copy = ControlLora.copy
         super_forward = ControlNet.forward
-
-        def KolorsControlNet_forward(self, x, hint, timesteps, context, **kwargs):
-            with torch.cuda.amp.autocast(enabled=True):
-                context = self.encoder_hid_proj(context)
-                return super_forward(self, x, hint, timesteps, context, **kwargs)
 
         def KolorsControlLora_pre_run(self, *args, **kwargs):
             result = super_pre_run(self, *args, **kwargs)
-
             if hasattr(self, "control_model"):
-                if hasattr(self.control_model, "encoder_hid_proj"):
-                    return result
-
-                setattr(self.control_model, "encoder_hid_proj",
-                        model.model.diffusion_model.encoder_hid_proj)
-
-                self.control_model.forward = MethodType(
-                    KolorsControlNet_forward, self.control_model)
-
+                self.control_model.forward = MethodType(KolorsControlNet_forward, self.control_model)
             return result
 
-        control_net.pre_run = MethodType(
-            KolorsControlLora_pre_run, control_net)
-
-        super_copy = ControlLora.copy
+        control_net.pre_run = MethodType(KolorsControlLora_pre_run, control_net)
 
         def KolorsControlLora_copy(self, *args, **kwargs):
             c = super_copy(self, *args, **kwargs)
-            c.pre_run = MethodType(
-                KolorsControlLora_pre_run, c)
+            c.pre_run = MethodType(KolorsControlLora_pre_run, c)
             return c
 
-        control_net.copy = MethodType(
-            KolorsControlLora_copy, control_net)
-
-        control_net = copy.deepcopy(control_net)
+        control_net.copy = MethodType(KolorsControlLora_copy, control_net)
 
     elif isinstance(control_net, comfy.controlnet.ControlNet):
         model_label_emb = model.model.diffusion_model.label_emb
 
         control_net.control_model.label_emb = model_label_emb
-        setattr(control_net.control_model, "encoder_hid_proj",
-                model.model.diffusion_model.encoder_hid_proj)
-
-        control_net.control_model_wrapped = comfy.model_patcher.ModelPatcher(
-            control_net.control_model, load_device=control_net.load_device, offload_device=comfy.model_management.unet_offload_device())
+        control_net.control_model_wrapped.model.label_emb = model_label_emb
 
         super_forward = ControlNet.forward
-
-        def KolorsControlNet_forward(self, x, hint, timesteps, context, **kwargs):
-            with torch.cuda.amp.autocast(enabled=True):
-                context = self.encoder_hid_proj(context)
-                return super_forward(self, x, hint, timesteps, context, **kwargs)
-
-        control_net.control_model.forward = MethodType(
-            KolorsControlNet_forward, control_net.control_model)
+        control_net.control_model.forward = MethodType(KolorsControlNet_forward, control_net.control_model)
 
     else:
-        raise NotImplementedError(
-            f"Type {control_net} not supported for KolorsControlNetPatch")
+        raise NotImplementedError(f"Type {type(control_net)} not supported for KolorsControlNetPatch")
 
     return (control_net,)
 
@@ -342,53 +270,3 @@ def MZ_KolorsCLIPVisionLoader_call(kwargs):
     with hook_comfyui_kolors_v2.apply_kolors():
         clip_vision = comfy.clip_vision.load(clip_path)
         return (clip_vision,)
-
-
-def MZ_ApplySDXLSamplingSettings_call(kwargs):
-    model = kwargs.get("model").clone()
-
-    import comfy.model_sampling
-    sampling_base = comfy.model_sampling.ModelSamplingDiscrete
-    sampling_type = comfy.model_sampling.EPS
-
-    class SDXLSampling(sampling_base, sampling_type):
-        pass
-
-    model.model.model_config.sampling_settings["beta_schedule"] = "linear"
-    model.model.model_config.sampling_settings["linear_start"] = 0.00085
-    model.model.model_config.sampling_settings["linear_end"] = 0.012
-    model.model.model_config.sampling_settings["timesteps"] = 1000
-
-    model_sampling = SDXLSampling(model.model.model_config)
-
-    model.add_object_patch("model_sampling", model_sampling)
-
-    return (model,)
-
-
-def MZ_ApplyCUDAGenerator_call(kwargs):
-    model = kwargs.get("model")
-
-    def prepare_noise(latent_image, seed, noise_inds=None):
-        """
-        creates random noise given a latent image and a seed.
-        optional arg skip can be used to skip and discard x number of noise generations for a given seed
-        """
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-        if noise_inds is None:
-            return torch.randn(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, generator=generator, device="cuda")
-
-        unique_inds, inverse = np.unique(noise_inds, return_inverse=True)
-        noises = []
-        for i in range(unique_inds[-1] + 1):
-            noise = torch.randn([1] + list(latent_image.size())[1:], dtype=latent_image.dtype,
-                                layout=latent_image.layout, generator=generator, device="cuda")
-            if i in unique_inds:
-                noises.append(noise)
-        noises = [noises[i] for i in inverse]
-        noises = torch.cat(noises, axis=0)
-        return noises
-
-    import comfy.sample
-    comfy.sample.prepare_noise = prepare_noise
-    return (model,)
